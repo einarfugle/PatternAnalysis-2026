@@ -1,2 +1,8 @@
 .vscode/
 .DS_Store
+data/
+__pycache__/
+*.py[cod]
+*.pt
+runs/
+predictions/
