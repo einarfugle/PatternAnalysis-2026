@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from dataset import HIPMRI_2D_ROOT, Nifti2DDataset, load_hipmri_splits
+from dataset import DEFAULT_IMAGE_SIZE, HIPMRI_2D_ROOT, Nifti2DDataset, load_hipmri_splits
 from modules import UNet2D
 from utils import (DiceCELoss, SegmentationMetrics, count_parameters,
                    peak_vram_bytes, reset_peak_vram, synchronize)
@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=_positive_int, default=8)
     parser.add_argument("--lr", type=_positive_float, default=1e-3)
     parser.add_argument("--base-channels", type=_positive_int, default=32)
+    parser.add_argument("--image-size", type=_positive_int, nargs=2, default=DEFAULT_IMAGE_SIZE,
+                        metavar=("HEIGHT", "WIDTH"), help="Shared image/mask size for batching.")
     parser.add_argument("--num-workers", type=_nonnegative_int, default=4)
     parser.add_argument("--seed", type=_nonnegative_int, default=42)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -148,7 +150,8 @@ def main() -> None:
                 indices = torch.linspace(0, len(items) - 1, args.max_slices).long().tolist()
                 pairs[split] = [items[index] for index in indices]
         print("SMOKE CHECK: --max-slices limits the experiment; do not report as final results.")
-    datasets = {split: Nifti2DDataset(items, class_values=CLASS_VALUES)
+    datasets = {split: Nifti2DDataset(items, class_values=CLASS_VALUES,
+                                    image_size=tuple(args.image_size))
                 for split, items in pairs.items()}
     generator = torch.Generator().manual_seed(args.seed)
     loaders = {
@@ -188,7 +191,8 @@ def main() -> None:
             torch.save({"model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "model_config": model_config,
-                        "class_values": list(CLASS_VALUES), "epoch": epoch,
+                        "class_values": list(CLASS_VALUES), "image_size": list(args.image_size),
+                        "epoch": epoch,
                         "best_val_mean_foreground_dice": best_score, "args": config}, best_path)
         write_json(args.output_dir / "history.json", history)
         print(f"Epoch {epoch:03d}/{args.epochs}: train loss={train_scores['loss']:.4f}, "
@@ -211,7 +215,8 @@ def main() -> None:
     del checkpoint
     test_scores = run_epoch(model, loaders["test"], criterion, device)
     result = {
-        "model_config": model_config, "class_values": list(CLASS_VALUES), "args": config,
+        "model_config": model_config, "class_values": list(CLASS_VALUES),
+        "image_size": list(args.image_size), "args": config,
         "seed": args.seed, "device": str(device), "hardware": hardware,
         "torch_version": str(torch.__version__), "parameter_count": parameter_count,
         "split_sizes": {split: len(data) for split, data in datasets.items()},

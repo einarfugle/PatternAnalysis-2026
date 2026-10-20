@@ -56,6 +56,13 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple:
         raise ValueError(f"Checkpoint must contain {sorted(required)}.")
     config = checkpoint["model_config"]
     class_values = checkpoint["class_values"]
+    # Older checkpoints used native-size inputs; preserve that behavior.
+    image_size = checkpoint.get("image_size")
+    if image_size is not None and (
+        not isinstance(image_size, (tuple, list)) or len(image_size) != 2
+        or any(type(size) is not int or size < 1 for size in image_size)
+    ):
+        raise ValueError("Checkpoint image_size must contain two positive integers.")
     if (not isinstance(config, dict)
             or set(config) != {"in_channels", "num_classes", "base_channels"}
             or any(type(value) is not int or value < 1 for value in config.values())):
@@ -73,7 +80,7 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple:
     model.eval()
     # Release the second copy of the weights before measuring inference memory.
     del checkpoint
-    return model, config, tuple(class_values)
+    return model, config, tuple(class_values), tuple(image_size) if image_size is not None else None
 
 
 def save_comparison(image: torch.Tensor, target: torch.Tensor,
@@ -126,13 +133,13 @@ def main() -> None:
         raise RuntimeError("CUDA was requested but is not available.")
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
                           else "cpu" if args.device == "auto" else args.device)
-    model, model_config, class_values = load_model(args.checkpoint, device)
+    model, model_config, class_values, image_size = load_model(args.checkpoint, device)
     all_pairs = load_hipmri_splits(args.data_root)["test"]
     pairs = all_pairs
     if args.max_slices is not None and args.max_slices < len(pairs):
         indices = torch.linspace(0, len(pairs) - 1, args.max_slices).long().tolist()
         pairs = [pairs[index] for index in indices]
-    dataset = Nifti2DDataset(pairs, class_values=class_values)
+    dataset = Nifti2DDataset(pairs, class_values=class_values, image_size=image_size)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     figure_count = min(args.num_figures, len(dataset))
     figure_indices = set(torch.linspace(0, len(dataset) - 1, figure_count).long().tolist())
@@ -173,7 +180,7 @@ def main() -> None:
                   "mean_slice_forward_seconds": statistics.mean(values)}
                  for case_id, values in sorted(case_times.items())]
     result = {"checkpoint": str(args.checkpoint), "model_config": model_config,
-              "class_values": list(class_values), "scores": scores,
+              "class_values": list(class_values), "image_size": image_size, "scores": scores,
               "metric_aggregation": "Pixel counts pooled over evaluated slices; "
                                     "foreground mean excludes background and classes "
                                     "absent from both prediction and target.",

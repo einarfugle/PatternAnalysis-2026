@@ -11,10 +11,12 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.utils.data import Dataset
 
 
 HIPMRI_2D_ROOT = Path("/home/groups/comp3710/HipMRI_Study_open/keras_slices_data")
+DEFAULT_IMAGE_SIZE = (256, 128)
 
 
 @dataclass(frozen=True)
@@ -96,12 +98,21 @@ class Nifti2DDataset(Dataset):
     class_values lists the audited original label IDs in model-channel order,
     background first. Use the same values for all splits. For example, (0, 5)
     maps original labels 0 and 5 to target indices 0 and 1. One-hot encoding for
-    Dice loss belongs in the loss function. No resizing or augmentation is done.
+    Dice loss belongs in the loss function. Images/masks are resized together
+    to image_size for batching (bilinear images, nearest-neighbour masks).
+    Use image_size=None only to inspect native sizes. No augmentation is done.
     """
 
-    def __init__(self, pairs: list[NiftiPair], *, class_values: tuple[int, ...]):
+    def __init__(self, pairs: list[NiftiPair], *, class_values: tuple[int, ...],
+                 image_size: tuple[int, int] | None = DEFAULT_IMAGE_SIZE):
         self.pairs = list(pairs)
         self.class_values = tuple(class_values)
+        self.image_size = tuple(image_size) if image_size is not None else None
+        if self.image_size is not None and (
+            len(self.image_size) != 2
+            or any(not isinstance(size, (int, np.integer)) or size < 1 for size in self.image_size)
+        ):
+            raise ValueError("image_size must contain two positive integers, or None.")
         if not self.pairs:
             raise ValueError("The dataset needs at least one image/mask pair.")
         if (not self.class_values or len(set(self.class_values)) != len(self.class_values)
@@ -131,5 +142,11 @@ class Nifti2DDataset(Dataset):
         for channel, label in enumerate(self.class_values):
             target[mask == label] = channel
         image = (image - image.mean()) / max(float(image.std()), 1e-8)
-        return (torch.from_numpy(image.astype(np.float32)).unsqueeze(0),
-                torch.from_numpy(target))
+        image = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
+        target = torch.from_numpy(target)
+        if self.image_size is not None and tuple(target.shape) != self.image_size:
+            image = F.interpolate(image.unsqueeze(0), size=self.image_size,
+                                  mode="bilinear", align_corners=False).squeeze(0)
+            target = F.interpolate(target[None, None].float(), size=self.image_size,
+                                   mode="nearest")[0, 0].long()
+        return image, target
