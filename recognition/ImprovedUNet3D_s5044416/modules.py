@@ -141,7 +141,7 @@ class ContextModule(nn.Module):
         return x + self.layers(x)
 
 
-class Down(nn.Module):
+class Down3D(nn.Module):
     """Stride-2 3x3x3 conv (instead of max pooling), then a context module."""
 
     def __init__(self, in_channels: int, out_channels: int, p_drop: float = 0.3):
@@ -154,7 +154,7 @@ class Down(nn.Module):
         return self.context(self.conv(x))
 
 
-class Up(nn.Module):
+class Up3D(nn.Module):
     """Upsample, 3x3x3 conv halving channels, concat skip, localization module.
     The last decoder level (final=True) uses a single 3x3x3 conv instead."""
 
@@ -174,7 +174,7 @@ class Up(nn.Module):
         return self.loc(torch.cat((skip, self.up_conv(x)), dim=1))
 
 
-class OutConv(nn.Module):
+class OutConv3D(nn.Module):
     """1x1x1 conv to one logit per class."""
 
     def __init__(self, in_channels: int, num_classes: int):
