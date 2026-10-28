@@ -13,8 +13,6 @@ Both models read the same 3D scans:
 4. VolumeDataset serves whole scans to the 3D model. AxialSliceDataset serves the axial
    slices of the same preprocessed scans to the 2D baseline.
 
-Create the split once on Rangpur with `python dataset.py --write-split`; running
-`python dataset.py` checks the saved split against the data.
 """
 
 import argparse
@@ -159,11 +157,22 @@ def split_scans(scans: list[Scan], split: dict) -> dict[str, list[Scan]]:
 
 def save_split(split: dict, path: str | Path = SPLIT_FILE, note: str = "") -> None:
     """Write the split as JSON. Never overwrite, so the test set cannot silently change."""
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"{path} already exists. Delete it first to make a new split.")
     data = ({"note": note} if note else {}) | {name: list(split[name]) for name in SPLIT_NAMES}
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    try:
+        # Mode "x" checks and creates in one step, so two runs cannot both write the file.
+        with Path(path).open("x") as handle:
+            handle.write(json.dumps(data, indent=2) + "\n")
+    except FileExistsError:
+        raise FileExistsError(f"{path} already exists. Delete it first to make a new split.") from None
+
+
+def create_split(scans: list[Scan], path: str | Path = SPLIT_FILE, *, val_patients: int = 5,
+                 test_patients: int = 7, seed: int = 42) -> None:
+    """Make the seeded patient split and save it; an existing file is never overwritten."""
+    split = make_patient_split(scans, val_patients=val_patients, test_patients=test_patients,
+                               seed=seed)
+    save_split(split, path, note=f"Patient-level split, seed {seed}; single-scan and "
+                                 "weekly-series patients shuffled separately.")
 
 
 def load_split(path: str | Path = SPLIT_FILE) -> dict[str, list[str]]:
@@ -300,11 +309,8 @@ def main() -> None:
 
     scans = discover_scans(args.root, args.image_dir, args.label_dir)
     if args.write_split:
-        split = make_patient_split(scans, val_patients=args.val_patients,
-                                   test_patients=args.test_patients, seed=args.seed)
-        save_split(split, args.split_file,
-                   note=f"Patient-level split, seed {args.seed}; single-scan and weekly-series "
-                        "patients shuffled separately.")
+        create_split(scans, args.split_file, val_patients=args.val_patients,
+                     test_patients=args.test_patients, seed=args.seed)
         print(f"Wrote {args.split_file}")
     split = load_split(args.split_file)
     for name, items in split_scans(scans, split).items():
