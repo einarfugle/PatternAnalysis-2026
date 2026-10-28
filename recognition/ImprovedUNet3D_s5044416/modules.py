@@ -201,18 +201,18 @@ class ImprovedUNet3D(nn.Module):
             nn.Conv3d(in_channels, b, kernel_size=3, padding=1, bias=False),
             ContextModule(b, p_drop),
         )
-        self.down1 = Down(b, b * 2, p_drop)
-        self.down2 = Down(b * 2, b * 4, p_drop)
-        self.down3 = Down(b * 4, b * 8, p_drop)
-        self.down4 = Down(b * 8, b * 16, p_drop)
-        self.up1 = Up(b * 16, b * 8)
-        self.up2 = Up(b * 8, b * 4)
-        self.up3 = Up(b * 4, b * 2)
-        self.up4 = Up(b * 2, b, final=True)
+        self.down1 = Down3D(b, b * 2, p_drop)
+        self.down2 = Down3D(b * 2, b * 4, p_drop)
+        self.down3 = Down3D(b * 4, b * 8, p_drop)
+        self.down4 = Down3D(b * 8, b * 16, p_drop)
+        self.up1 = Up3D(b * 16, b * 8)
+        self.up2 = Up3D(b * 8, b * 4)
+        self.up3 = Up3D(b * 4, b * 2)
+        self.up4 = Up3D(b * 2, b, final=True)
         # Deep supervision heads
-        self.seg2 = OutConv(b * 4, num_classes)
-        self.seg3 = OutConv(b * 2, num_classes)
-        self.outc = OutConv(b * 2, num_classes)
+        self.seg2 = OutConv3D(b * 4, num_classes)
+        self.seg3 = OutConv3D(b * 2, num_classes)
+        self.outc = OutConv3D(b * 2, num_classes)
 
     @staticmethod
     def _upsum(s: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
