@@ -8,15 +8,20 @@ Both models read the same 3D scans:
 3. load_scan() reorients a scan to RAS and lays it out as [D, H, W], where D is the
    axial (inferior to superior) slice index. It downsamples every axis by
    DEFAULT_DOWNSAMPLE = 2, so 256 x 256 x 128 voxels become 128 x 128 x 64 (block mean
-   for MR, majority vote for labels), then z-scores the MR using only that scan's own
-   voxels, so no statistics are shared between splits.
+   for MR, majority vote for labels; downsample=1 keeps the native grid). It then
+   z-scores the MR using only that scan's own voxels, so no statistics are shared
+   between splits.
 4. VolumeDataset serves whole scans to the 3D model. AxialSliceDataset serves the axial
    slices of the same preprocessed scans to the 2D baseline.
+5. Augmentation (training data only) applies the same kind of random in-plane flip,
+   rotation, scaling and intensity change to both: one transform per scan for the 3D
+   model, one per slice for the 2D model.
 
 """
 
 import argparse
 import json
+import math
 import random
 import re
 from collections import Counter
@@ -37,7 +42,8 @@ SPLIT_FILE = Path(__file__).resolve().parent / "patient_split.json"
 SPLIT_NAMES = ("train", "val", "test")
 # Label IDs in the order given in the HipMRI study description.
 LABEL_NAMES = ("background", "body", "bone", "bladder", "rectum", "prostate")
-# Integer factor applied to every axis; 1 keeps the native ~1.6 mm voxel grid.
+# Integer factor applied to every axis, as the brief asks for downsampled 3D data;
+# 1 keeps the native ~1.6 mm voxel grid.
 DEFAULT_DOWNSAMPLE = 2
 
 _SCAN_NAME = re.compile(r"(?P<patient>.+?)_Week(?P<week>[0-9]+)(?:_.+)?\.nii(?:\.gz)?")
@@ -247,23 +253,84 @@ def load_scan(scan: Scan,
     return image, target, spacing
 
 
+def _uniform(low: float, high: float) -> float:
+    return float(torch.empty(()).uniform_(low, high))
+
+
+@dataclass(frozen=True)
+class Augmentation:
+    """Random training augmentation in the axial plane, shared by both models.
+
+    Each call draws one transform for a whole sample: a scan for the 3D model, whose
+    slices all move together, or a single slice for the 2D model. The sample may be
+    flipped left-right, then rotated and scaled about the slice centre (bilinear MR,
+    nearest-neighbour labels, edge values outside the image). Finally the MR gets a
+    random contrast, brightness and Gaussian noise. Flips along the other two axes are
+    left out because they would put the bladder below or behind the prostate.
+    """
+
+    flip_probability: float = 0.5
+    spatial_probability: float = 0.5
+    max_rotation_degrees: float = 10.0
+    scale_range: tuple[float, float] = (0.9, 1.1)
+    contrast_range: tuple[float, float] = (0.9, 1.1)
+    max_brightness: float = 0.1
+    max_noise_std: float = 0.05
+
+    def __call__(self, image: torch.Tensor,
+                 target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Augment an MR [1, D, H, W] and its labels [D, H, W]; D is 1 for a slice."""
+        if torch.rand(()) < self.flip_probability:
+            image, target = image.flip(-1), target.flip(-1)
+        if torch.rand(()) < self.spatial_probability:
+            image, target = self._rotate_and_scale(image, target)
+        contrast = _uniform(*self.contrast_range)
+        brightness = _uniform(-self.max_brightness, self.max_brightness)
+        noise_std = _uniform(0.0, self.max_noise_std)
+        image = image * contrast + brightness + noise_std * torch.randn_like(image)
+        return image, target
+
+    def _rotate_and_scale(self, image: torch.Tensor,
+                          target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        angle = math.radians(_uniform(-self.max_rotation_degrees, self.max_rotation_degrees))
+        scale = _uniform(*self.scale_range)
+        depth, height, width = target.shape
+        cos, sin = math.cos(angle) / scale, math.sin(angle) / scale
+        # Maps output to input positions in normalised coordinates; the height/width
+        # factors keep the rotation rigid on non-square slices.
+        theta = torch.tensor([[cos, -sin * height / width, 0.0],
+                              [sin * width / height, cos, 0.0]])
+        grid = F.affine_grid(theta.expand(depth, 2, 3), [depth, 1, height, width],
+                             align_corners=False)
+        image = F.grid_sample(image[0].unsqueeze(1), grid, mode="bilinear",
+                              padding_mode="border", align_corners=False)
+        target = F.grid_sample(target.unsqueeze(1).float(), grid, mode="nearest",
+                               padding_mode="border", align_corners=False)
+        return image.squeeze(1).unsqueeze(0), target.squeeze(1).long()
+
+
 class VolumeDataset(Dataset):
     """Whole preprocessed scans for the 3D model: image [1, D, H, W], target [D, H, W].
 
-    Scans can differ in size, so use batch_size=1 (or crop to a common size).
+    Scans can differ in size, so use batch_size=1 (or crop to a common size). Pass an
+    Augmentation for training data only.
     """
 
-    def __init__(self, scans: list[Scan], *, downsample: int = DEFAULT_DOWNSAMPLE):
+    def __init__(self, scans: list[Scan], *, downsample: int = DEFAULT_DOWNSAMPLE,
+                 augmentation: Augmentation | None = None):
         if not scans:
             raise ValueError("The dataset needs at least one scan.")
         self.scans = list(scans)
         self.downsample = downsample
+        self.augmentation = augmentation
 
     def __len__(self) -> int:
         return len(self.scans)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         image, target, _ = load_scan(self.scans[index], self.downsample)
+        if self.augmentation is not None:
+            image, target = self.augmentation(image, target)
         return image, target
 
 
@@ -272,13 +339,16 @@ class AxialSliceDataset(Dataset):
 
     Returns image [1, H, W] and target [H, W]. Every scan is loaded once through
     load_scan() and kept in memory (about 5 MB per scan at the default downsampling,
-    40 MB at native resolution), so each slice is normalized exactly as in VolumeDataset.
+    40 MB at native resolution), so each slice is normalized exactly as in VolumeDataset. Pass an
+    Augmentation for training data only.
     """
 
-    def __init__(self, scans: list[Scan], *, downsample: int = DEFAULT_DOWNSAMPLE):
+    def __init__(self, scans: list[Scan], *, downsample: int = DEFAULT_DOWNSAMPLE,
+                 augmentation: Augmentation | None = None):
         if not scans:
             raise ValueError("The dataset needs at least one scan.")
         self.scans = list(scans)
+        self.augmentation = augmentation
         self.images, self.targets, self.slices = [], [], []
         for number, scan in enumerate(self.scans):
             image, target, _ = load_scan(scan, downsample)
@@ -291,7 +361,13 @@ class AxialSliceDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         number, depth = self.slices[index]
-        return self.images[number][depth].unsqueeze(0).clone(), self.targets[number][depth].long()
+        image = self.images[number][depth].unsqueeze(0).clone()
+        target = self.targets[number][depth].long()
+        if self.augmentation is not None:
+            # A slice is a one-slice volume: [1, 1, H, W] and [1, H, W].
+            image, target = self.augmentation(image.unsqueeze(1), target.unsqueeze(0))
+            image, target = image[:, 0], target[0]
+        return image, target
 
 
 def main() -> None:
