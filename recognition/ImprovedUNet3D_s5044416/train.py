@@ -3,8 +3,9 @@
     python train.py --model unet2d       # 2D U-Net on axial slices
     python train.py --model improved3d   # 3D Improved U-Net on whole scans
 
-Both models read the same downsampled scans and patient split from dataset.py; the first
-run creates patient_split.json if it is missing. Both use the same Dice + cross-entropy
+Both models read the same 2×-downsampled scans (--downsample 1 keeps full resolution)
+and patient split from dataset.py, with the same training augmentation (--no-augment
+turns it off). The first run creates patient_split.json if it is missing. Both use the same Dice + cross-entropy
 loss and Adam schedule, and they are validated identically: each
 epoch, whole validation scans are predicted (slice by slice for the 2D model) and
 scored on the working grid, and the checkpoint with the best mean foreground Dice over
@@ -18,6 +19,7 @@ import json
 import math
 import platform
 import random
+from dataclasses import asdict
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
@@ -27,8 +29,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import (DEFAULT_DOWNSAMPLE, DEFAULT_ROOT, IMAGE_DIR, LABEL_DIR, LABEL_NAMES,
-                     SPLIT_FILE, AxialSliceDataset, Scan, VolumeDataset, create_split,
-                     discover_scans, load_scan, load_split, split_scans)
+                     SPLIT_FILE, Augmentation, AxialSliceDataset, Scan, VolumeDataset,
+                     create_split, discover_scans, load_scan, load_split, split_scans)
 from utils import (CHART_RC, INK_MUTED, LABEL_COLORS, MODELS, DiceCELoss, ModelSpec,
                    SegmentationMetrics, confusion_matrix, count_parameters, evaluate_scans,
                    format_summary, patient_summary, peak_vram_bytes, predict_volume,
@@ -79,7 +81,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-dir", default=IMAGE_DIR)
     parser.add_argument("--label-dir", default=LABEL_DIR)
     parser.add_argument("--split-file", type=Path, default=SPLIT_FILE)
-    parser.add_argument("--downsample", type=_positive_int, default=DEFAULT_DOWNSAMPLE)
+    parser.add_argument("--downsample", type=_positive_int, default=DEFAULT_DOWNSAMPLE,
+                        help="Integer factor for every axis (default 2); 1 keeps full resolution.")
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
+                        help="Random flip, rotation, scaling and intensity changes on the "
+                             "training data (default: on).")
     parser.add_argument("--output-dir", type=Path, help="Default: runs/<model>.")
     parser.add_argument("--epochs", type=_positive_int, default=50)
     parser.add_argument("--batch-size", type=_positive_int,
@@ -137,7 +143,7 @@ def validate(model: torch.nn.Module, volumes: list[tuple[Scan, torch.Tensor, tor
     losses, records = [], []
     for _, image, target in volumes:
         logits = predict_volume(model, image.to(device), slicewise=spec.slicewise)
-        target = target.to(device)
+        target = target.to(device).long()
         losses.append(criterion(logits, target.unsqueeze(0)).item())
         confusion = confusion_matrix(logits.argmax(dim=1)[0], target, len(LABEL_NAMES))
         records.append(scores_from_confusion(confusion))
@@ -229,14 +235,21 @@ def main() -> None:
                 scans[name] = [items[index] for index in indices]
         print("SMOKE CHECK: --max-scans limits the experiment; do not report these results.")
     print("Scans: " + ", ".join(f"{name}={len(items)}" for name, items in scans.items())
-          + f"; downsampled by {args.downsample}. Loading training and validation scans...")
+          + f"; downsampled by {args.downsample}; augmentation {'on' if args.augment else 'off'}. "
+          "Loading training and validation scans...")
+    augmentation = Augmentation() if args.augment else None
     dataset_class = AxialSliceDataset if spec.slicewise else VolumeDataset
-    train_data = dataset_class(scans["train"], downsample=args.downsample)
+    train_data = dataset_class(scans["train"], downsample=args.downsample,
+                               augmentation=augmentation)
     loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda",
                         generator=torch.Generator().manual_seed(args.seed),
                         persistent_workers=args.num_workers > 0)
-    val_volumes = [(scan, *load_scan(scan, args.downsample)[:2]) for scan in scans["val"]]
+    val_volumes = []
+    for scan in scans["val"]:
+        image, target, _ = load_scan(scan, args.downsample)
+        # uint8 labels keep the cached validation set small at full resolution.
+        val_volumes.append((scan, image, target.to(torch.uint8)))
 
     model_config = {"in_channels": 1, "num_classes": len(LABEL_NAMES),
                     "base_channels": args.base_channels}
@@ -294,7 +307,8 @@ def main() -> None:
     test = summarize(records)
     result = {
         "model": args.model, "model_config": model_config, "label_names": list(LABEL_NAMES),
-        "args": config, "device": str(device), "hardware": hardware,
+        "args": config, "augmentation": asdict(augmentation) if augmentation else None,
+        "device": str(device), "hardware": hardware,
         "torch_version": str(torch.__version__), "parameter_count": parameter_count,
         "split_patients": {name: len(patients) for name, patients in split.items()},
         "scans": {name: len(items) for name, items in scans.items()},
