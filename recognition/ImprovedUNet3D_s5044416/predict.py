@@ -7,12 +7,14 @@ predictions are resampled to the full-resolution labels before scoring, so every
 is scored on the same voxels (utils.evaluate_scans). Tables give the mean ± SD over test
 patients (each patient's scans averaged first), with scores pooled over all test voxels
 in brackets. Saved to --output-dir: metrics.json, scan_scores.csv, class_scores.png,
-prostate_regions.png and case_<patient>_week<n>.png comparison panels.
+prostate_regions.png, case_<patient>_week<n>.png comparison panels and
+overview_<patient>_week<n>.png wider views of the same cases with each model's errors marked.
 """
 
 import argparse
 import csv
 import json
+import math
 import platform
 from pathlib import Path
 
@@ -39,6 +41,9 @@ ORGANS = ("bladder", "rectum", "prostate")
 # Categorical slots for up to three models; each model type keeps its own colour first.
 PALETTE = ("#2a78d6", "#eb6834", "#1baf7a")
 OUTLINE = [patheffects.withStroke(linewidth=2.4, foreground="black")]
+# Organ errors in the error maps, chosen to stand apart from the organ colours.
+ERROR_COLORS = {"false positive": "#e3242b", "false negative": "#00a6ff",
+                "wrong organ": "#ff3fd2"}
 
 
 def _positive_int(value: str) -> int:
@@ -336,21 +341,68 @@ def _overlay(labels: torch.Tensor) -> torch.Tensor:
     return rgba
 
 
-def _draw(ax: plt.Axes, mri: torch.Tensor, labels: torch.Tensor, outline: torch.Tensor | None,
-          window: tuple[float, float], aspect: float) -> None:
+def _errors(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Organ error masks. False positives are organ predicted in body, bone or background,
+    false negatives are organ predicted as one of those, and "wrong organ" is one organ
+    predicted as another."""
+    organs = torch.tensor([LABEL_NAMES.index(organ) for organ in ORGANS])
+    predicted, true = torch.isin(prediction, organs), torch.isin(target, organs)
+    return {"false positive": predicted & ~true, "false negative": true & ~predicted,
+            "wrong organ": predicted & true & (prediction != target)}
+
+
+def _error_overlay(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """RGBA image with correctly labelled organs lightly filled and errors in solid colour."""
+    rgba = torch.zeros((*target.shape, 4))
+    for organ in ORGANS:
+        label = LABEL_NAMES.index(organ)
+        rgba[(prediction == label) & (target == label)] = torch.tensor(
+            [*to_rgb(LABEL_COLORS[organ]), 0.3])
+    for name, mask in _errors(prediction, target).items():
+        rgba[mask] = torch.tensor([*to_rgb(ERROR_COLORS[name]), 0.9])
+    return rgba
+
+
+def _show(ax: plt.Axes, mri: torch.Tensor, rgba: torch.Tensor, window: tuple[float, float],
+          aspect: float) -> None:
     ax.imshow(mri, cmap="gray", vmin=window[0], vmax=window[1], aspect=aspect,
               interpolation="nearest")
-    ax.imshow(_overlay(labels), aspect=aspect, interpolation="nearest")
+    ax.imshow(rgba, aspect=aspect, interpolation="nearest")
+    ax.set(xticks=[], yticks=[])
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _draw(ax: plt.Axes, mri: torch.Tensor, labels: torch.Tensor, outline: torch.Tensor | None,
+          window: tuple[float, float], aspect: float) -> None:
+    _show(ax, mri, _overlay(labels), window, aspect)
     if outline is not None:
         for organ in ORGANS:
             mask = outline == LABEL_NAMES.index(organ)
             if mask.any():
                 ax.contour(mask.float(), levels=[0.5], colors="white",
                            linewidths=1.0).set(path_effects=OUTLINE)
-    ax.set(xticks=[], yticks=[])
-    ax.grid(False)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+
+
+def _prostate_layout(target: torch.Tensor) -> tuple[list[tuple[str, int]], int, int, int, int] | None:
+    """Axial slices at the centre of the apex, mid-gland and base thirds, the first and
+    last prostate slice, and the prostate's mean (H, W) position; None without a prostate."""
+    prostate = target == PROSTATE
+    present = prostate.flatten(1).any(dim=1).nonzero().flatten()
+    if present.numel() == 0:
+        return None
+    first, last = int(present[0]), int(present[-1])
+    thirds = torch.arange(first, last + 1).tensor_split(3)
+    rows = [(name, int(part[len(part) // 2]))
+            for name, part in zip(("Apex", "Mid-gland", "Base"), thirds) if len(part)]
+    _, prostate_h, prostate_w = prostate.nonzero(as_tuple=True)
+    return rows, first, last, int(prostate_h.float().mean()), int(prostate_w.float().mean())
+
+
+def _intensity_window(image: torch.Tensor) -> tuple[float, float]:
+    sample = image.flatten()[::7]
+    return float(sample.quantile(0.01)), float(sample.quantile(0.995))
 
 
 def _annotate(ax: plt.Axes, text: str) -> None:
@@ -367,22 +419,15 @@ def plot_case(scan: Scan, outputs: list[dict], results: list[dict], subtitle: st
     outline is an error.
     """
     image, target, spacing = outputs[0]["image"], outputs[0]["target"], outputs[0]["spacing"]
-    prostate = target == PROSTATE
-    present = prostate.flatten(1).any(dim=1).nonzero().flatten()
-    if present.numel() == 0:
+    layout = _prostate_layout(target)
+    if layout is None:
         print(f"Skipped {path.name}: the ground truth has no prostate.")
         return
-    first, last = int(present[0]), int(present[-1])
-    thirds = torch.arange(first, last + 1).tensor_split(3)
-    rows = [(name, int(part[len(part) // 2]))
-            for name, part in zip(("Apex", "Mid-gland", "Base"), thirds) if len(part)]
-    _, prostate_h, prostate_w = prostate.nonzero(as_tuple=True)
-    centre_w = int(prostate_w.float().mean())
-    h0, h1 = _window(int(prostate_h.float().mean()), 40, target.shape[1])
+    rows, first, last, centre_h, centre_w = layout
+    h0, h1 = _window(centre_h, 40, target.shape[1])
     w0, w1 = _window(centre_w, 40, target.shape[2])
     d0, d1 = max(first - 12, 0), min(last + 13, target.shape[0])
-    sample = image.flatten()[::7]
-    window = (float(sample.quantile(0.01)), float(sample.quantile(0.995)))
+    window = _intensity_window(image)
     maps = [target, *(output["prediction"] for output in outputs)]
     columns = ["Ground truth", *(result["label"] for result in results)]
     # Physical height of the sagittal panel relative to the (square) axial panels.
@@ -416,6 +461,73 @@ def plot_case(scan: Scan, outputs: list[dict], results: list[dict], subtitle: st
         handles = [Patch(color=LABEL_COLORS[organ], alpha=0.5, label=organ) for organ in ORGANS]
         handles.append(Line2D([], [], color="white", linewidth=1.5, path_effects=OUTLINE,
                               label="true organ outline"))
+        fig.legend(handles=handles, loc="outside lower center", ncol=len(handles))
+        fig.suptitle(f"Patient {scan.patient_id}, week {scan.week}\n{subtitle}", fontsize=10)
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+
+
+def plot_case_overview(scan: Scan, outputs: list[dict], results: list[dict], subtitle: str,
+                       path: Path) -> None:
+    """A wider view of a plot_case scan: each model's segmentation with its organ errors marked.
+
+    Rows are the same apex, mid-gland and base slices, over about 27 cm of the pelvis,
+    and a sagittal cut through the whole scan. The ground-truth column fills the organs;
+    model columns fill correct organ voxels lightly and colour the errors (_errors).
+    """
+    image, target, spacing = outputs[0]["image"], outputs[0]["target"], outputs[0]["spacing"]
+    layout = _prostate_layout(target)
+    if layout is None:
+        print(f"Skipped {path.name}: the ground truth has no prostate.")
+        return
+    rows, _, _, centre_h, centre_w = layout
+    h0, h1 = _window(centre_h, 80, target.shape[1])
+    w0, w1 = _window(centre_w, 80, target.shape[2])
+    window = _intensity_window(image)
+    predictions = [output["prediction"] for output in outputs]
+    columns = ["Ground truth", *(result["label"] for result in results)]
+    voxel_ml = math.prod(spacing) / 1000
+    # Physical height of the sagittal panel relative to the (square) axial panels.
+    sagittal = target.shape[0] * spacing[0] / ((h1 - h0) * spacing[1])
+
+    def axial(volume: torch.Tensor, depth: int) -> torch.Tensor:
+        # Radiological view: anterior at the top, the patient's right on the left.
+        return volume[depth, h0:h1, w0:w1].flip(0).flip(1)
+
+    def sagittal_cut(volume: torch.Tensor) -> torch.Tensor:
+        # Superior at the top, anterior on the left.
+        return volume[:, h0:h1, centre_w].flip(0).flip(1)
+
+    with plt.rc_context(CHART_RC):
+        fig, axes = plt.subplots(len(rows) + 1, len(columns), squeeze=False, layout="constrained",
+                                 figsize=(3.2 * len(columns), 3.2 * (len(rows) + sagittal) + 1.2),
+                                 gridspec_kw={"height_ratios": [1] * len(rows) + [sagittal]})
+        for row, (name, depth) in enumerate(rows):
+            mri, truth = axial(image, depth), axial(target, depth)
+            _show(axes[row, 0], mri, _overlay(truth), window, spacing[1] / spacing[2])
+            for column, prediction in enumerate(predictions, start=1):
+                _show(axes[row, column], mri, _error_overlay(axial(prediction, depth), truth),
+                      window, spacing[1] / spacing[2])
+                _annotate(axes[row, column],
+                          f"prostate slice Dice {_dice(prediction[depth], target[depth])}")
+            axes[row, 0].set_ylabel(f"{name}\naxial slice {depth}")
+        mri, truth = sagittal_cut(image), sagittal_cut(target)
+        _show(axes[-1, 0], mri, _overlay(truth), window, spacing[0] / spacing[1])
+        for column, prediction in enumerate(predictions, start=1):
+            _show(axes[-1, column], mri, _error_overlay(sagittal_cut(prediction), truth), window,
+                  spacing[0] / spacing[1])
+            millilitres = {name: int(mask.sum()) * voxel_ml
+                           for name, mask in _errors(prediction, target).items()}
+            _annotate(axes[-1, column], f"prostate scan Dice {_dice(prediction, target)}")
+            axes[-1, column].set_xlabel(
+                f"Organ errors in the whole scan:\nFP {millilitres['false positive']:.1f} mL, "
+                f"FN {millilitres['false negative']:.1f} mL, "
+                f"wrong organ {millilitres['wrong organ']:.1f} mL", fontsize=8)
+        axes[-1, 0].set_ylabel("Sagittal, through\nthe prostate centre")
+        for column, name in enumerate(columns):
+            axes[0, column].set_title(name)
+        handles = [Patch(color=LABEL_COLORS[organ], alpha=0.5, label=organ) for organ in ORGANS]
+        handles += [Patch(color=color, alpha=0.9, label=name) for name, color in ERROR_COLORS.items()]
         fig.legend(handles=handles, loc="outside lower center", ncol=len(handles))
         fig.suptitle(f"Patient {scan.patient_id}, week {scan.week}\n{subtitle}", fontsize=10)
         fig.savefig(path, dpi=150)
@@ -479,10 +591,11 @@ def main() -> None:
                    for entry in entries]
         dice_text = ", ".join(f"{result['label']} {_dice(output['prediction'], output['target'])}"
                               for result, output in zip(results, outputs))
-        name = f"case_{scan.patient_id}_week{scan.week}.png"
-        plot_case(scan, outputs, results, f"{reason}. Prostate Dice per scan: {dice_text}",
-                  args.output_dir / name)
-        figures.append(name)
+        subtitle = f"{reason}. Prostate Dice per scan: {dice_text}"
+        for prefix, plot in (("case", plot_case), ("overview", plot_case_overview)):
+            name = f"{prefix}_{scan.patient_id}_week{scan.week}.png"
+            plot(scan, outputs, results, subtitle, args.output_dir / name)
+            figures.append(name)
     print(f"\nSaved metrics.json, scan_scores.csv and {', '.join(figures)} to {args.output_dir}")
 
 
